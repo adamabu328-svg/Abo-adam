@@ -1,0 +1,790 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { AppState, Transaction, FiberTenant, Contact, AppSettings, CurrencyCode, FiberPartnerConfig } from './types';
+import { loadAppState, saveAppState, exportTransactionsToCSV, INITIAL_STATE, shouldShowBackupReminder } from './utils/storage';
+import { getTenantPaymentStatus, getCurrentYearMonth, getTodayDateString, getCurrentTimeString, formatMonthLabel, decodeReceiptShareUrl } from './utils/formatters';
+import { applyTheme } from './utils/theme';
+import { Header } from './components/Header';
+import { BottomNav, TabType } from './components/BottomNav';
+import { DashboardView } from './components/DashboardView';
+import { TransactionsView } from './components/TransactionsView';
+import { FiberRentalsView } from './components/FiberRentalsView';
+import { ContactsView } from './components/ContactsView';
+import { ReportsView } from './components/ReportsView';
+import { TransactionModal } from './components/TransactionModal';
+import { PWAInstallGuideModal } from './components/PWAInstallGuideModal';
+import { BackupReminderBanner } from './components/BackupReminderBanner';
+import { LocalNotificationsModal } from './components/LocalNotificationsModal';
+import { DeviceAuthorizationModal } from './components/DeviceAuthorizationModal';
+import { FiberRentReceiptModal, FiberRentReceiptData } from './components/FiberRentReceiptModal';
+import { CloudSyncModal } from './components/CloudSyncModal';
+import { syncNotificationsWithServiceWorker } from './utils/notificationManager';
+import { isCurrentDeviceAuthorized, getThisDeviceId } from './utils/deviceSecurity';
+import { 
+  testFirebaseConnection, 
+  pushStateToCloud, 
+  fetchStateFromCloud, 
+  subscribeToCloudState, 
+  DEFAULT_SYNC_WORKSPACE_ID 
+} from './utils/firebase';
+import { RotateCcw, CheckCircle2 } from 'lucide-react';
+
+export default function App() {
+  const [appState, setAppState] = useState<AppState>(() => loadAppState());
+  const [activeTab, setActiveTab] = useState<TabType>('dashboard');
+
+  // Shared Receipt URL Modal State (when opened via WhatsApp link ?rcpt=...&d=...)
+  const [sharedReceiptData, setSharedReceiptData] = useState<FiberRentReceiptData | null>(() => {
+    const decoded = decodeReceiptShareUrl();
+    if (decoded && decoded.receiptNumber) {
+      return {
+        tenant: {
+          id: 'shared',
+          name: decoded.tenantName || 'المشترك',
+          phone: decoded.tenantPhone || '',
+          lineCode: decoded.lineCode || '',
+          planSpeed: decoded.planSpeed || '',
+          monthlyRent: decoded.amount || 0,
+          currency: decoded.currency || 'YER',
+          dueDay: decoded.dueDay || 1,
+          status: 'active',
+          createdAt: decoded.date || new Date().toISOString(),
+        },
+        startMonth: decoded.startMonth || getCurrentYearMonth(),
+        endMonth: decoded.endMonth || getCurrentYearMonth(),
+        monthsCount: decoded.monthsCount || 1,
+        amount: decoded.amount || 0,
+        currency: decoded.currency || 'YER',
+        receiptNumber: decoded.receiptNumber,
+        date: decoded.date || getTodayDateString(),
+        time: decoded.time || '',
+        notes: decoded.notes || '',
+      };
+    }
+    return null;
+  });
+  
+  // Transaction Modal State (for both ADD and EDIT)
+  const [isTxModalOpen, setIsTxModalOpen] = useState(false);
+  const [editingTx, setEditingTx] = useState<Transaction | null>(null);
+
+  // Install Guide Modal State
+  const [isInstallGuideOpen, setIsInstallGuideOpen] = useState(false);
+
+  // Fiber Due Messaging Modal State (for quick navigation from Dashboard)
+  const [openDueModalOnFiber, setOpenDueModalOnFiber] = useState(false);
+
+  // Local Notifications Scheduling Modal State
+  const [isNotificationsModalOpen, setIsNotificationsModalOpen] = useState(false);
+
+  // Single iPhone Master Device Security State
+  const [isDeviceAuthModalOpen, setIsDeviceAuthModalOpen] = useState(false);
+  const [pendingAuthorizedAction, setPendingAuthorizedAction] = useState<(() => void) | null>(null);
+
+  // Undo Deleted Transaction Toast State
+  const [lastDeletedTx, setLastDeletedTx] = useState<Transaction | null>(null);
+  const [showUndoToast, setShowUndoToast] = useState(false);
+  const undoTimerRef = useRef<any>(null);
+
+  // Guard action: only allow transaction modifications on the authorized master iPhone
+  const executeWithDeviceAuth = (action: () => void) => {
+    if (isCurrentDeviceAuthorized(appState.settings)) {
+      action();
+    } else {
+      setPendingAuthorizedAction(() => action);
+      setIsDeviceAuthModalOpen(true);
+    }
+  };
+
+  // Cloud Sync State (Laptop ↔️ Android Phone)
+  const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
+  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<'synced' | 'syncing' | 'error' | 'idle'>('synced');
+  const [lastCloudSyncTime, setLastCloudSyncTime] = useState<string | undefined>(appState.settings.cloudSync?.lastSyncTime);
+  const [lastCloudDeviceName, setLastCloudDeviceName] = useState<string | undefined>(appState.settings.cloudSync?.deviceName);
+  const isRemoteUpdatingRef = useRef(false);
+  const myDeviceIdRef = useRef<string>('');
+
+  useEffect(() => {
+    myDeviceIdRef.current = getThisDeviceId();
+  }, []);
+
+  // Initialize and subscribe to Firestore Cloud Workspace for instant live sync
+  useEffect(() => {
+    testFirebaseConnection().catch(() => {});
+
+    const workspaceId = appState.settings.cloudSync?.workspaceId || DEFAULT_SYNC_WORKSPACE_ID;
+    const isCloudEnabled = appState.settings.cloudSync?.isEnabled ?? true;
+
+    if (!isCloudEnabled) return;
+
+    const unsubscribe = subscribeToCloudState(
+      workspaceId,
+      (remote) => {
+        // If the update was triggered by this device, ignore to prevent loops
+        if (remote.lastDeviceId && remote.lastDeviceId === myDeviceIdRef.current) {
+          setLastCloudSyncTime(remote.updatedAt);
+          setLastCloudDeviceName(remote.lastDeviceName);
+          return;
+        }
+
+        isRemoteUpdatingRef.current = true;
+        setAppState((current) => ({
+          ...current,
+          settings: {
+            ...current.settings,
+            ...remote.settings,
+            deviceSecurity: current.settings.deviceSecurity,
+            cloudSync: {
+              ...current.settings.cloudSync,
+              workspaceId,
+              lastSyncTime: remote.updatedAt,
+              lastSyncStatus: 'synced',
+            },
+          },
+          contacts: remote.contacts || current.contacts,
+          fiberTenants: remote.fiberTenants || current.fiberTenants,
+          transactions: remote.transactions || current.transactions,
+          fiberPartner: remote.fiberPartner || current.fiberPartner,
+        }));
+        setLastCloudSyncTime(remote.updatedAt);
+        setLastCloudDeviceName(remote.lastDeviceName);
+        setCloudSyncStatus('synced');
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 400);
+      },
+      () => {
+        setCloudSyncStatus('error');
+      }
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, [appState.settings.cloudSync?.workspaceId, appState.settings.cloudSync?.isEnabled]);
+
+  // Auto-push state to cloud when local changes happen (debounced)
+  useEffect(() => {
+    const isCloudEnabled = appState.settings.cloudSync?.isEnabled ?? true;
+    const isAutoSync = appState.settings.cloudSync?.autoSync ?? true;
+    const workspaceId = appState.settings.cloudSync?.workspaceId || DEFAULT_SYNC_WORKSPACE_ID;
+    const deviceName = appState.settings.cloudSync?.deviceName || (typeof window !== 'undefined' && /mobile|android|iphone/i.test(navigator.userAgent) ? 'هاتف أندرويد' : 'لابتوب / كمبيوتر');
+
+    if (!isCloudEnabled || !isAutoSync || isRemoteUpdatingRef.current) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        setIsCloudSyncing(true);
+        setCloudSyncStatus('syncing');
+        await pushStateToCloud(workspaceId, appState, myDeviceIdRef.current, deviceName);
+        setLastCloudSyncTime(new Date().toISOString());
+        setLastCloudDeviceName(deviceName);
+        setCloudSyncStatus('synced');
+      } catch (err) {
+        console.warn('Auto cloud push error:', err);
+        setCloudSyncStatus('error');
+      } finally {
+        setIsCloudSyncing(false);
+      }
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [appState.transactions, appState.fiberTenants, appState.contacts, appState.fiberPartner, appState.settings.cashRegister]);
+
+  const handleManualPushToCloud = async () => {
+    const workspaceId = appState.settings.cloudSync?.workspaceId || DEFAULT_SYNC_WORKSPACE_ID;
+    const deviceName = appState.settings.cloudSync?.deviceName || 'جهازي';
+    setIsCloudSyncing(true);
+    setCloudSyncStatus('syncing');
+    try {
+      await pushStateToCloud(workspaceId, appState, myDeviceIdRef.current, deviceName);
+      setLastCloudSyncTime(new Date().toISOString());
+      setLastCloudDeviceName(deviceName);
+      setCloudSyncStatus('synced');
+    } finally {
+      setIsCloudSyncing(false);
+    }
+  };
+
+  const handleManualPullFromCloud = async () => {
+    const workspaceId = appState.settings.cloudSync?.workspaceId || DEFAULT_SYNC_WORKSPACE_ID;
+    setIsCloudSyncing(true);
+    setCloudSyncStatus('syncing');
+    try {
+      const remote = await fetchStateFromCloud(workspaceId);
+      if (remote) {
+        isRemoteUpdatingRef.current = true;
+        setAppState((current) => ({
+          ...current,
+          settings: {
+            ...current.settings,
+            ...remote.settings,
+            deviceSecurity: current.settings.deviceSecurity,
+          },
+          contacts: remote.contacts || current.contacts,
+          fiberTenants: remote.fiberTenants || current.fiberTenants,
+          transactions: remote.transactions || current.transactions,
+          fiberPartner: remote.fiberPartner || current.fiberPartner,
+        }));
+        setLastCloudSyncTime(remote.updatedAt);
+        setLastCloudDeviceName(remote.lastDeviceName);
+        setCloudSyncStatus('synced');
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 400);
+      }
+    } finally {
+      setIsCloudSyncing(false);
+    }
+  };
+
+  // Auto-save to localStorage whenever appState changes
+  useEffect(() => {
+    saveAppState(appState);
+  }, [appState]);
+
+  // Synchronize Scheduled Notifications with Service Worker
+  useEffect(() => {
+    // Sync reminders to SW whenever appState (fiberTenants, settings, transactions) changes
+    syncNotificationsWithServiceWorker(appState).catch(() => {});
+
+    // Periodic foreground sync check every 30 minutes
+    const interval = setInterval(() => {
+      syncNotificationsWithServiceWorker(appState).catch(() => {});
+    }, 30 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [appState.fiberTenants, appState.settings.localNotifications, appState.transactions]);
+
+  // Listen to Service Worker messages and URL query navigation (e.g. user clicked notification)
+  useEffect(() => {
+    // 1. Check URL parameters
+    if (typeof window !== 'undefined') {
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get('openDue') === 'true' || urlParams.get('tab') === 'fiber') {
+        setActiveTab('fiber');
+        setOpenDueModalOnFiber(true);
+      }
+      if (urlParams.get('notifications') === 'true') {
+        setIsNotificationsModalOpen(true);
+      }
+    }
+
+    // 2. Listen to postMessage from Service Worker on notification click
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      const handleSwMessage = (event: MessageEvent) => {
+        if (event.data?.type === 'NAVIGATE_TO_DUE') {
+          setActiveTab('fiber');
+          setOpenDueModalOnFiber(true);
+        }
+      };
+
+      navigator.serviceWorker.addEventListener('message', handleSwMessage);
+      return () => navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+    }
+  }, []);
+
+  // Apply theme and listen to OS system dark mode changes in real-time
+  useEffect(() => {
+    const mode = appState.settings.themeMode || 'system';
+    applyTheme(mode);
+
+    if (mode === 'system' && typeof window !== 'undefined' && window.matchMedia) {
+      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      const handleMediaChange = () => {
+        applyTheme('system');
+      };
+      mediaQuery.addEventListener('change', handleMediaChange);
+      return () => mediaQuery.removeEventListener('change', handleMediaChange);
+    }
+  }, [appState.settings.themeMode]);
+
+  // Calculate overdue/due count for Fiber badge
+  const fiberDueCount = appState.fiberTenants.filter((t) => {
+    const s = getTenantPaymentStatus(t);
+    return s.status === 'overdue' || s.status === 'due_today';
+  }).length;
+
+  // Transaction Handlers
+  const handleSaveTransaction = (savedTx: Transaction) => {
+    setAppState((prev) => {
+      const existingIdx = prev.transactions.findIndex((t) => t.id === savedTx.id);
+      let updatedTransactions: Transaction[];
+      if (existingIdx >= 0) {
+        // Edit existing transaction
+        updatedTransactions = [...prev.transactions];
+        updatedTransactions[existingIdx] = savedTx;
+      } else {
+        // Add new transaction to top of list
+        updatedTransactions = [savedTx, ...prev.transactions];
+      }
+
+      // If this transaction was linked to a contact not in contacts list, add them automatically
+      let updatedContacts = [...prev.contacts];
+      if (savedTx.contactName && !savedTx.contactId) {
+        const nameExists = prev.contacts.some((c) => c.name.toLowerCase() === savedTx.contactName?.toLowerCase());
+        if (!nameExists) {
+          updatedContacts.push({
+            id: 'c_' + Date.now(),
+            name: savedTx.contactName,
+            category: 'عميل',
+            createdAt: new Date().toISOString(),
+          });
+        }
+      }
+
+      return {
+        ...prev,
+        transactions: updatedTransactions,
+        contacts: updatedContacts,
+      };
+    });
+  };
+
+  const handleDeleteTransaction = (id: string, reason?: string) => {
+    executeWithDeviceAuth(() => {
+      const targetTx = appState.transactions.find((t) => t.id === id);
+      if (targetTx) {
+        setLastDeletedTx(targetTx);
+        setShowUndoToast(true);
+        if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+        undoTimerRef.current = setTimeout(() => {
+          setShowUndoToast(false);
+          setLastDeletedTx(null);
+        }, 8000);
+      }
+      setAppState((prev) => ({
+        ...prev,
+        transactions: prev.transactions.filter((t) => t.id !== id),
+      }));
+    });
+  };
+
+  const handleUndoDelete = () => {
+    if (!lastDeletedTx) return;
+    setAppState((prev) => ({
+      ...prev,
+      transactions: [lastDeletedTx, ...prev.transactions.filter((t) => t.id !== lastDeletedTx.id)],
+    }));
+    setShowUndoToast(false);
+    setLastDeletedTx(null);
+  };
+
+  const handleOpenQuickAdd = (preselectedType?: any) => {
+    executeWithDeviceAuth(() => {
+      setEditingTx(null);
+      setIsTxModalOpen(true);
+    });
+  };
+
+  const handleOpenEditTransaction = (tx: Transaction) => {
+    executeWithDeviceAuth(() => {
+      setEditingTx(tx);
+      setIsTxModalOpen(true);
+    });
+  };
+
+  // Fiber Net Handlers
+  const handleAddFiberTenant = (newTenant: FiberTenant) => {
+    setAppState((prev) => {
+      // Also add to contacts if not existing
+      let updatedContacts = [...prev.contacts];
+      if (!prev.contacts.some((c) => c.name === newTenant.name)) {
+        updatedContacts.push({
+          id: 'c_' + Date.now(),
+          name: newTenant.name,
+          phone: newTenant.phone,
+          category: 'مستأجر_فايبر',
+          notes: `مشترك في ${newTenant.lineCode} - ${newTenant.planSpeed}`,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      return {
+        ...prev,
+        fiberTenants: [newTenant, ...prev.fiberTenants],
+        contacts: updatedContacts,
+      };
+    });
+  };
+
+  const handleUpdateFiberTenant = (updatedTenant: FiberTenant) => {
+    setAppState((prev) => ({
+      ...prev,
+      fiberTenants: prev.fiberTenants.map((t) => (t.id === updatedTenant.id ? updatedTenant : t)),
+    }));
+  };
+
+  const handleDeleteFiberTenant = (tenantId: string) => {
+    setAppState((prev) => ({
+      ...prev,
+      fiberTenants: prev.fiberTenants.filter((t) => t.id !== tenantId),
+    }));
+  };
+
+  // 1-Click Pay Fiber Rent Handler (supports single month, partial payments, arrears, and advance multi-months)
+  const handlePayRent = (
+    tenant: FiberTenant,
+    month: string,
+    amount: number,
+    currency: CurrencyCode,
+    monthsCount: number = 1,
+    startMonth?: string,
+    notes?: string,
+    arrearsRemaining?: number
+  ) => {
+    executeWithDeviceAuth(() => {
+      const today = getTodayDateString();
+      const time = getCurrentTimeString();
+
+      const count = monthsCount || 1;
+      const start = startMonth || month;
+      const desc = count > 1 
+        ? `سداد إيجار خط الفايبر (${tenant.lineCode}) مقدماً لـ ${count} أشهر (من ${formatMonthLabel(start)} حتى ${formatMonthLabel(month)})${notes ? ` - ${notes}` : ''}`
+        : `سداد إيجار خط الفايبر (${tenant.lineCode}) لشهر ${formatMonthLabel(month)}${notes ? ` - ${notes}` : ''}`;
+
+      // 1. Create Receipt Transaction in Cash Register
+      const newTx: Transaction = {
+        id: 'tx_' + Date.now(),
+        type: 'fiber_rent',
+        amount,
+        currency,
+        date: today,
+        time,
+        contactName: tenant.name,
+        category: 'شبكات وفايبر نت',
+        description: desc,
+        affectCashRegister: appState.settings.cashRegister.isEnabled,
+        fiberTenantId: tenant.id,
+        fiberMonth: month,
+        createdAt: new Date().toISOString(),
+      };
+
+      const newTxs: Transaction[] = [newTx];
+
+      // 2. If there are arrears remaining from a partial payment, record a debt_to_me transaction
+      if (arrearsRemaining && arrearsRemaining > 0) {
+        const arrearsTx: Transaction = {
+          id: 'tx_arr_' + Date.now(),
+          type: 'debt_to_me',
+          amount: arrearsRemaining,
+          currency,
+          date: today,
+          time,
+          contactName: tenant.name,
+          category: 'شبكات وفايبر نت',
+          description: `متأخرات متبقية من إيجار خط الفايبر (${tenant.lineCode}) لشهر ${formatMonthLabel(month)} (سداد جزئي: تم استلام ${amount} والمتبقي ${arrearsRemaining})`,
+          affectCashRegister: false,
+          fiberTenantId: tenant.id,
+          fiberMonth: month,
+          createdAt: new Date(Date.now() + 1000).toISOString(),
+        };
+        newTxs.push(arrearsTx);
+      }
+
+      // 3. Update tenant status and arrears balance
+      const updatedTenant: FiberTenant = {
+        ...tenant,
+        lastPaidMonth: month,
+        lastPaymentDate: today,
+        arrearsBalance: arrearsRemaining && arrearsRemaining > 0 ? arrearsRemaining : 0,
+        notes: arrearsRemaining && arrearsRemaining > 0
+          ? (tenant.notes ? `${tenant.notes} | [متأخرات سداد جزئي ${month}: ${arrearsRemaining} ${currency}]` : `[متأخرات سداد جزئي ${month}: ${arrearsRemaining} ${currency}]`)
+          : tenant.notes,
+      };
+
+      setAppState((prev) => ({
+        ...prev,
+        fiberTenants: prev.fiberTenants.map((t) => (t.id === tenant.id ? updatedTenant : t)),
+        transactions: [...newTxs, ...prev.transactions],
+      }));
+    });
+  };
+
+  const handleUpdateFiberPartnerConfig = (newConfig: FiberPartnerConfig) => {
+    setAppState((prev) => ({
+      ...prev,
+      fiberPartner: newConfig,
+    }));
+  };
+
+  // Contacts Handlers
+  const handleAddContact = (contact: Contact) => {
+    setAppState((prev) => ({
+      ...prev,
+      contacts: [contact, ...prev.contacts],
+    }));
+  };
+
+  const handleUpdateContact = (contact: Contact) => {
+    setAppState((prev) => ({
+      ...prev,
+      contacts: prev.contacts.map((c) => (c.id === contact.id ? contact : c)),
+    }));
+  };
+
+  const handleDeleteContact = (id: string) => {
+    setAppState((prev) => ({
+      ...prev,
+      contacts: prev.contacts.filter((c) => c.id !== id),
+    }));
+  };
+
+  const handleRecordTxForContact = (contact: Contact) => {
+    executeWithDeviceAuth(() => {
+      setEditingTx({
+        id: 'tx_' + Date.now(),
+        type: 'income',
+        amount: 0,
+        currency: appState.settings.defaultCurrency,
+        date: getTodayDateString(),
+        time: getCurrentTimeString(),
+        contactId: contact.id,
+        contactName: contact.name,
+        description: '',
+        affectCashRegister: appState.settings.cashRegister.isEnabled,
+        createdAt: new Date().toISOString(),
+      });
+      setIsTxModalOpen(true);
+    });
+  };
+
+  // Settings & Reset Handlers
+  const handleUpdateSettings = (newSettings: AppSettings) => {
+    setAppState((prev) => ({
+      ...prev,
+      settings: newSettings,
+    }));
+  };
+
+  const handleRestoreState = (newState: AppState) => {
+    setAppState(newState);
+  };
+
+  const handleResetData = () => {
+    const emptyState: AppState = {
+      ...INITIAL_STATE,
+      contacts: [],
+      transactions: [],
+      fiberTenants: [],
+    };
+    setAppState(emptyState);
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-100 flex flex-col antialiased selection:bg-emerald-500 selection:text-white">
+      
+      {/* Top Header */}
+      <Header
+        settings={appState.settings}
+        onUpdateSettings={handleUpdateSettings}
+        onOpenQuickAdd={() => handleOpenQuickAdd()}
+        onOpenInstallGuide={() => setIsInstallGuideOpen(true)}
+        onOpenNotifications={() => setIsNotificationsModalOpen(true)}
+        notificationDueCount={fiberDueCount}
+        isDeviceAuthorized={isCurrentDeviceAuthorized(appState.settings)}
+        onOpenDeviceAuth={() => setIsDeviceAuthModalOpen(true)}
+        onOpenCloudSync={() => setIsCloudSyncModalOpen(true)}
+        isCloudSyncing={isCloudSyncing}
+        cloudSyncStatus={cloudSyncStatus}
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+      />
+
+      {/* Main Container */}
+      <main className="flex-1 max-w-6xl w-full mx-auto p-3 sm:p-5 sm:py-6 pb-24 md:pb-12">
+        {(() => {
+          const reminderStatus = shouldShowBackupReminder(appState.settings);
+          if (!reminderStatus.shouldShow) return null;
+          return (
+            <BackupReminderBanner
+              appState={appState}
+              daysSinceLastBackup={reminderStatus.daysSinceLastBackup}
+              frequencyDays={reminderStatus.frequencyDays}
+              onUpdateSettings={handleUpdateSettings}
+              onNavigateToSettings={() => setActiveTab('reports')}
+            />
+          );
+        })()}
+
+        {activeTab === 'dashboard' && (
+          <DashboardView
+            appState={appState}
+            onNavigateTab={(tab) => {
+              if (tab === 'fiber') setOpenDueModalOnFiber(false);
+              setActiveTab(tab);
+            }}
+            onOpenQuickAdd={handleOpenQuickAdd}
+            onEditTransaction={handleOpenEditTransaction}
+            onOpenDueMessaging={() => {
+              setOpenDueModalOnFiber(true);
+              setActiveTab('fiber');
+            }}
+            onOpenInstallGuide={() => setIsInstallGuideOpen(true)}
+          />
+        )}
+
+        {activeTab === 'transactions' && (
+          <TransactionsView
+            transactions={appState.transactions}
+            onEditTransaction={handleOpenEditTransaction}
+            onDeleteTransaction={handleDeleteTransaction}
+            onOpenQuickAdd={() => handleOpenQuickAdd()}
+            onExportCSV={() => exportTransactionsToCSV(appState.transactions)}
+          />
+        )}
+
+        {activeTab === 'fiber' && (
+          <FiberRentalsView
+            tenants={appState.fiberTenants}
+            transactions={appState.transactions}
+            partnerConfig={appState.fiberPartner}
+            onAddTenant={handleAddFiberTenant}
+            onUpdateTenant={handleUpdateFiberTenant}
+            onDeleteTenant={handleDeleteFiberTenant}
+            onPayRent={handlePayRent}
+            onUpdatePartnerConfig={handleUpdateFiberPartnerConfig}
+            onSaveTransaction={handleSaveTransaction}
+            whatsappTemplate={appState.settings.whatsappTemplate}
+            defaultCurrency={appState.settings.defaultCurrency}
+            exchangeRates={appState.settings.exchangeRates}
+            onUpdateTemplate={(newTemplate) => {
+              handleUpdateSettings({
+                ...appState.settings,
+                whatsappTemplate: newTemplate,
+              });
+            }}
+            initialOpenDueModal={openDueModalOnFiber}
+            onOpenNotificationsModal={() => setIsNotificationsModalOpen(true)}
+          />
+        )}
+
+        {activeTab === 'contacts' && (
+          <ContactsView
+            contacts={appState.contacts}
+            transactions={appState.transactions}
+            onAddContact={handleAddContact}
+            onUpdateContact={handleUpdateContact}
+            onDeleteContact={handleDeleteContact}
+            onRecordTxForContact={handleRecordTxForContact}
+            onSaveTransaction={handleSaveTransaction}
+            onDeleteTransaction={handleDeleteTransaction}
+          />
+        )}
+
+        {activeTab === 'reports' && (
+          <ReportsView
+            appState={appState}
+            onUpdateSettings={handleUpdateSettings}
+            onRestoreState={handleRestoreState}
+            onResetData={handleResetData}
+            onNavigateTab={(tab) => setActiveTab(tab)}
+            onOpenNotificationsModal={() => setIsNotificationsModalOpen(true)}
+            onOpenInstallGuide={() => setIsInstallGuideOpen(true)}
+          />
+        )}
+      </main>
+
+      {/* iOS Bottom Navigation Bar */}
+      <BottomNav
+        activeTab={activeTab}
+        onSelectTab={(tab) => setActiveTab(tab)}
+        onOpenQuickAdd={() => handleOpenQuickAdd()}
+        fiberDueCount={fiberDueCount}
+      />
+
+      {/* Transaction Modal (Add & Edit) */}
+      <TransactionModal
+        isOpen={isTxModalOpen}
+        onClose={() => setIsTxModalOpen(false)}
+        onSave={handleSaveTransaction}
+        initialTransaction={editingTx}
+        contacts={appState.contacts}
+        cashRegisterEnabled={appState.settings.cashRegister.isEnabled}
+        defaultCurrency={appState.settings.defaultCurrency}
+      />
+
+      {/* PWA Add to Home Screen Modal */}
+      <PWAInstallGuideModal
+        isOpen={isInstallGuideOpen}
+        onClose={() => setIsInstallGuideOpen(false)}
+        onOpenCloudSync={() => {
+          setIsInstallGuideOpen(false);
+          setIsCloudSyncModalOpen(true);
+        }}
+      />
+
+      {/* Cloud Sync Modal (Laptop ↔️ Android Phone) */}
+      <CloudSyncModal
+        isOpen={isCloudSyncModalOpen}
+        onClose={() => setIsCloudSyncModalOpen(false)}
+        settings={appState.settings}
+        onUpdateSettings={handleUpdateSettings}
+        onManualPush={handleManualPushToCloud}
+        onManualPull={handleManualPullFromCloud}
+        isSyncing={isCloudSyncing}
+        lastSyncTime={lastCloudSyncTime}
+        lastDeviceName={lastCloudDeviceName}
+      />
+
+      {/* Local Scheduled Notifications Modal */}
+      <LocalNotificationsModal
+        isOpen={isNotificationsModalOpen}
+        onClose={() => setIsNotificationsModalOpen(false)}
+        appState={appState}
+        onUpdateSettings={handleUpdateSettings}
+        onOpenDueMessagingModal={() => {
+          setActiveTab('fiber');
+          setOpenDueModalOnFiber(true);
+        }}
+      />
+
+      {/* Single Authorized iPhone Security Modal */}
+      <DeviceAuthorizationModal
+        isOpen={isDeviceAuthModalOpen}
+        onClose={() => {
+          setIsDeviceAuthModalOpen(false);
+          setPendingAuthorizedAction(null);
+        }}
+        settings={appState.settings}
+        onUpdateSettings={handleUpdateSettings}
+        onAuthorizedSuccess={() => {
+          if (pendingAuthorizedAction) {
+            pendingAuthorizedAction();
+            setPendingAuthorizedAction(null);
+          }
+        }}
+      />
+
+      {/* Shared Receipt Modal when opened via WhatsApp link (?rcpt=...&d=...) */}
+      <FiberRentReceiptModal
+        isOpen={!!sharedReceiptData}
+        onClose={() => setSharedReceiptData(null)}
+        receiptData={sharedReceiptData}
+      />
+
+      {/* Floating Undo Toast for Deleted Transaction */}
+      {showUndoToast && lastDeletedTx && (
+        <div className="fixed bottom-20 sm:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white px-4 py-3 rounded-2xl shadow-2xl border border-slate-700 backdrop-blur-md flex items-center gap-3 animate-in fade-in slide-in-from-bottom-4 duration-200">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          <div className="text-xs">
+            <span className="font-bold block">تم مسح الحركة المالية بنجاح</span>
+            <span className="text-[11px] text-slate-300">
+              {lastDeletedTx.description || 'حركة مالية'} ({lastDeletedTx.amount} {lastDeletedTx.currency})
+            </span>
+          </div>
+          <button
+            onClick={handleUndoDelete}
+            className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-600 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition active:scale-95 shadow-xs shrink-0"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>تراجع ↩</span>
+          </button>
+        </div>
+      )}
+
+    </div>
+  );
+}
